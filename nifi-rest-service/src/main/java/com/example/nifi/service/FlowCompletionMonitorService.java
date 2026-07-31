@@ -42,12 +42,26 @@ public class FlowCompletionMonitorService {
         int consecutiveEmptyChecks;
         boolean isMonitoring;
         List<QueueStatus> lastQueueStatuses;
-
+        
+        // Ключевые поля для отличия "не стартовал" от "завершился"
+        boolean flowHasStarted = false;
+        boolean hasSeenActiveProcessors = false;
+        boolean hasSeenDataInQueues = false;
+        Long firstActivityTimestamp = null;
+        int totalFlowFileCountAtStart = 0;
+        
         MonitoringState() {
             this.startTime = System.currentTimeMillis();
             this.consecutiveEmptyChecks = 0;
             this.isMonitoring = true;
             this.lastQueueStatuses = new ArrayList<>();
+        }
+        
+        /**
+         * Проверить, что поток действительно запустился (была активность)
+         */
+        boolean confirmFlowStarted() {
+            return flowHasStarted || hasSeenActiveProcessors || hasSeenDataInQueues;
         }
     }
 
@@ -144,6 +158,10 @@ public class FlowCompletionMonitorService {
         MonitoringState state = new MonitoringState();
         monitoringStates.put(processGroupId, state);
         
+        // Сохраняем начальное состояние очередей для сравнения
+        FlowCompletionStatus initialStatus = checkFlowCompletion(processGroupId, config);
+        state.totalFlowFileCountAtStart = initialStatus.getTotalFlowFileCount();
+        
         long timeout = config.getMaxWaitTimeMs();
         long interval = config.getCheckIntervalMs();
         long startTime = System.currentTimeMillis();
@@ -155,46 +173,95 @@ public class FlowCompletionMonitorService {
                 if (elapsed > timeout) {
                     state.isMonitoring = false;
                     FlowCompletionStatus timeoutStatus = checkFlowCompletion(processGroupId, config);
-                    timeoutStatus.setStatus("TIMEOUT");
-                    timeoutStatus.setMessage("Превышено максимальное время ожидания: " + timeout + " мс");
+                    
+                    // Определяем причину таймаута
+                    if (!state.confirmFlowStarted()) {
+                        timeoutStatus.setStatus("NOT_STARTED");
+                        timeoutStatus.setMessage("Поток не стартовал: не было обнаружено активности в очередях или процессорах");
+                    } else {
+                        timeoutStatus.setStatus("TIMEOUT");
+                        timeoutStatus.setMessage("Превышено максимальное время ожидания: " + timeout + " мс");
+                    }
+                    
                     throw new java.util.concurrent.TimeoutException("Flow completion timeout after " + elapsed + " ms");
                 }
                 
                 // Выполняем проверку
                 FlowCompletionStatus status = checkFlowCompletion(processGroupId, config);
                 
-                // Если поток завершен, возвращаем результат
-                if (status.isCompleted()) {
-                    state.isMonitoring = false;
-                    logger.info("Flow completion detected for process group: {}", processGroupId);
-                    return status;
+                // === КЛЮЧЕВОЙ АЛГОРИТМ: Отслеживание активности потока ===
+                
+                // Фиксируем первую активность (появление данных в очередях)
+                int currentTotalFlowFiles = status.getTotalFlowFileCount();
+                if (currentTotalFlowFiles > 0 && !state.hasSeenDataInQueues) {
+                    state.hasSeenDataInQueues = true;
+                    state.firstActivityTimestamp = System.currentTimeMillis();
+                    logger.info("Detected data in queues: {} files (first activity)", currentTotalFlowFiles);
                 }
                 
-                // Обновляем состояние
-                state.lastQueueStatuses = status.getQueueStatuses();
+                // Фиксируем активность процессоров
+                if (status.getActiveProcessorCount() > 0 && !state.hasSeenActiveProcessors) {
+                    state.hasSeenActiveProcessors = true;
+                    if (state.firstActivityTimestamp == null) {
+                        state.firstActivityTimestamp = System.currentTimeMillis();
+                    }
+                    logger.info("Detected active processors: {}/{}", status.getActiveProcessorCount(), status.getTotalProcessorCount());
+                }
                 
-                // Проверяем счётчик последовательных пустых проверок
+                // Поток считается запущенным, если была любая активность
+                if (state.confirmFlowStarted() && !state.flowHasStarted) {
+                    state.flowHasStarted = true;
+                    logger.info("Flow confirmed as STARTED at timestamp: {}", state.firstActivityTimestamp);
+                }
+                
+                // === ЛОГИКА ЗАВЕРШЕНИЯ ===
+                
+                // Если поток ещё не стартовал и очереди пусты - это нормально, продолжаем ждать
+                if (!state.confirmFlowStarted() && status.getTotalFlowFileCount() == 0) {
+                    logger.debug("Flow not started yet, queues empty. Waiting for activity...");
+                    state.consecutiveEmptyChecks = 0; // Сбрасываем, т.к. это не признак завершения
+                    Thread.sleep(interval);
+                    continue;
+                }
+                
+                // Если поток стартовал и очереди пусты - проверяем завершение
                 boolean allQueuesEmpty = status.getQueueStatuses().stream()
                         .allMatch(q -> q.getFlowFileCount() <= config.getEmptyQueueThreshold() && 
                                       q.getQueueSize() <= config.getEmptyQueueSizeThreshold());
                 
                 if (allQueuesEmpty) {
-                    state.consecutiveEmptyChecks++;
-                    logger.debug("Consecutive empty checks: {}/{}", 
-                                state.consecutiveEmptyChecks, config.getConsecutiveEmptyChecksRequired());
-                    
-                    if (state.consecutiveEmptyChecks >= config.getConsecutiveEmptyChecksRequired()) {
-                        // Дополнительная проверка: нет ли активных процессоров
-                        if (status.getActiveProcessorCount() == 0 || !config.isConsiderOnlyActiveProcessors()) {
-                            status.setCompleted(true);
-                            status.setStatus("COMPLETED");
-                            status.setMessage("Все очереди пусты в течение " + 
-                                            (state.consecutiveEmptyChecks * interval / 1000) + " секунд");
-                            state.isMonitoring = false;
-                            return status;
+                    // Важно: считаем очереди пустыми только если поток УЖЕ стартовал
+                    if (state.confirmFlowStarted()) {
+                        state.consecutiveEmptyChecks++;
+                        logger.debug("Consecutive empty checks (after start): {}/{}", 
+                                    state.consecutiveEmptyChecks, config.getConsecutiveEmptyChecksRequired());
+                        
+                        if (state.consecutiveEmptyChecks >= config.getConsecutiveEmptyChecksRequired()) {
+                            // Дополнительная проверка: нет ли активных процессоров
+                            if (status.getActiveProcessorCount() == 0 || !config.isConsiderOnlyActiveProcessors()) {
+                                status.setCompleted(true);
+                                status.setStatus("COMPLETED");
+                                
+                                long flowDuration = state.firstActivityTimestamp != null 
+                                    ? (System.currentTimeMillis() - state.firstActivityTimestamp) 
+                                    : 0L;
+                                    
+                                status.setMessage(String.format(
+                                    "Поток завершен: все очереди пусты в течение %d сек (общее время работы: %d мс)",
+                                    state.consecutiveEmptyChecks * interval / 1000,
+                                    flowDuration
+                                ));
+                                state.isMonitoring = false;
+                                return status;
+                            }
                         }
+                    } else {
+                        // Очереди пусты, но поток ещё не стартовал - это НЕ завершение
+                        logger.debug("Queues empty but flow hasn't started yet - not counting as completion");
+                        state.consecutiveEmptyChecks = 0;
                     }
                 } else {
+                    // Очереди не пусты - сбрасываем счётчик
                     state.consecutiveEmptyChecks = 0;
                 }
                 
