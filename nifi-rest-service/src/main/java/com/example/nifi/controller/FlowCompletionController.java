@@ -1,7 +1,7 @@
 package com.example.nifi.controller;
 
-import com.example.nifi.model.FlowCompletionConfig;
-import com.example.nifi.model.FlowCompletionStatus;
+import com.example.nifi.model.*;
+import com.example.nifi.service.CallbackService;
 import com.example.nifi.service.FlowCompletionMonitorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,7 +16,14 @@ import java.util.Map;
 import java.util.concurrent.*;
 
 /**
- * Контроллер для управления мониторингом завершения потоков NiFi
+ * Контроллер для управления мониторингом завершения потоков NiFi.
+ * 
+ * АРХИТЕКТУРА ИНТЕГРАЦИИ:
+ * 1. NiFi запускает процессорную группу по расписанию
+ * 2. Сразу после старта вызывается InvokeHTTP → POST /api/nifi/flow-monitor/start
+ * 3. Сервис создаёт изолированную сессию мониторинга с чистым состоянием
+ * 4. Сервис отслеживает появление FlowFile (признак старта) и опустошение очередей
+ * 5. При завершении отправляет результат на callback URL в NiFi
  */
 @RestController
 @RequestMapping("/api/nifi/flow-monitor")
@@ -26,54 +33,62 @@ public class FlowCompletionController {
     private static final Logger logger = LoggerFactory.getLogger(FlowCompletionController.class);
 
     private final FlowCompletionMonitorService monitorService;
+    private final CallbackService callbackService;
     
     // Пул потоков для асинхронного мониторинга
     private final ExecutorService executorService = Executors.newCachedThreadPool();
     
-    // Хранилище будущих результатов мониторинга
-    private final Map<String, Future<FlowCompletionStatus>> activeMonitors = new ConcurrentHashMap<>();
+    // Хранилище активных сессий мониторинга
+    private final Map<String, MonitoringSession> activeSessions = new ConcurrentHashMap<>();
 
-    public FlowCompletionController(FlowCompletionMonitorService monitorService) {
+    public FlowCompletionController(FlowCompletionMonitorService monitorService, 
+                                    CallbackService callbackService) {
         this.monitorService = monitorService;
+        this.callbackService = callbackService;
     }
 
     /**
-     * Однократная проверка статуса завершения потока
-     * POST /api/nifi/flow-monitor/{processGroupId}/check
+     * Внутренний класс для хранения состояния сессии мониторинга
      */
-    @PostMapping("/{processGroupId}/check")
-    public ResponseEntity<FlowCompletionStatus> checkFlowCompletion(
-            @PathVariable String processGroupId,
-            @RequestBody(required = false) FlowCompletionConfig config) {
+    private static class MonitoringSession {
+        final String correlationId;
+        final String flowName;
+        final String callbackUrl;
+        final Map<String, String> metadata;
+        final long startTime;
+        Future<FlowMonitoringResult> future;
         
-        logger.info("Checking flow completion for process group: {}", processGroupId);
-        
-        if (config == null) {
-            config = createDefaultConfig();
-        }
-        
-        try {
-            FlowCompletionStatus status = monitorService.checkFlowCompletion(processGroupId, config);
-            return ResponseEntity.ok(status);
-        } catch (Exception e) {
-            logger.error("Error checking flow completion", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        MonitoringSession(String correlationId, String flowName, String callbackUrl, Map<String, String> metadata) {
+            this.correlationId = correlationId;
+            this.flowName = flowName;
+            this.callbackUrl = callbackUrl;
+            this.metadata = metadata;
+            this.startTime = System.currentTimeMillis();
         }
     }
 
     /**
-     * Запустить асинхронный мониторинг завершения потока
-     * POST /api/nifi/flow-monitor/{processGroupId}/start-monitoring
+     * ЗАПУСК МОНИТОРИНГА ИЗ NIFI
+     * Вызывается из NiFi через InvokeHTTP сразу после стартового блока по расписанию.
+     * 
+     * POST /api/nifi/flow-monitor/start
      */
-    @PostMapping("/{processGroupId}/start-monitoring")
-    public ResponseEntity<Map<String, Object>> startMonitoring(
-            @PathVariable String processGroupId,
-            @RequestBody(required = false) FlowCompletionConfig config) {
+    @PostMapping("/start")
+    public ResponseEntity<Map<String, Object>> startMonitoringFromNiFi(
+            @RequestBody FlowMonitoringRequest request) {
         
-        logger.info("Starting async monitoring for process group: {}", processGroupId);
+        logger.info("=== Starting monitoring from NiFi: processGroupId={}, correlationId={}, flowName={} ===", 
+                   request.getProcessGroupId(), request.getCorrelationId(), request.getFlowName());
         
-        // Проверяем, не запущен ли уже мониторинг
-        if (activeMonitors.containsKey(processGroupId)) {
+        String processGroupId = request.getProcessGroupId();
+        
+        if (processGroupId == null || processGroupId.isEmpty()) {
+            return buildErrorResponse("processGroupId is required", HttpStatus.BAD_REQUEST);
+        }
+        
+        // Проверяем, не запущен ли уже мониторинг для этой группы
+        if (activeSessions.containsKey(processGroupId)) {
+            logger.warn("Monitoring already running for processGroupId={}", processGroupId);
             Map<String, Object> response = new HashMap<>();
             response.put("status", "ALREADY_RUNNING");
             response.put("message", "Мониторинг уже запущен для этой процессорной группы");
@@ -81,42 +96,34 @@ public class FlowCompletionController {
             return ResponseEntity.ok(response);
         }
         
-        if (config == null) {
-            config = createDefaultConfig();
-        }
+        // Создаём конфигурацию из запроса
+        FlowCompletionConfig config = request.toConfig();
         
-        final FlowCompletionConfig finalConfig = config;
+        // Создаём сессию мониторинга
+        MonitoringSession session = new MonitoringSession(
+            request.getCorrelationId() != null ? request.getCorrelationId() : generateCorrelationId(),
+            request.getFlowName(),
+            request.getCallbackUrl(),
+            request.getMetadata()
+        );
         
         try {
-            // Запускаем асинхронную задачу
-            Future<FlowCompletionStatus> future = executorService.submit(() -> {
-                try {
-                    return monitorService.waitForFlowCompletion(processGroupId, finalConfig);
-                } catch (TimeoutException e) {
-                    logger.warn("Monitoring timeout for process group: {}", processGroupId);
-                    FlowCompletionStatus timeoutStatus = new FlowCompletionStatus();
-                    timeoutStatus.setProcessGroupId(processGroupId);
-                    timeoutStatus.setCompleted(false);
-                    timeoutStatus.setStatus("TIMEOUT");
-                    timeoutStatus.setMessage(e.getMessage());
-                    return timeoutStatus;
-                } catch (InterruptedException e) {
-                    logger.info("Monitoring interrupted for process group: {}", processGroupId);
-                    Thread.currentThread().interrupt();
-                    FlowCompletionStatus interruptedStatus = new FlowCompletionStatus();
-                    interruptedStatus.setProcessGroupId(processGroupId);
-                    interruptedStatus.setCompleted(false);
-                    interruptedStatus.setStatus("INTERRUPTED");
-                    interruptedStatus.setMessage("Мониторинг был прерван");
-                    return interruptedStatus;
-                }
+            // Запускаем асинхронную задачу мониторинга
+            Future<FlowMonitoringResult> future = executorService.submit(() -> {
+                return runMonitoringSession(processGroupId, session, config);
             });
             
-            activeMonitors.put(processGroupId, future);
+            session.future = future;
+            activeSessions.put(processGroupId, session);
             
+            logger.info("Monitoring session created: correlationId={}, processGroupId={}", 
+                       session.correlationId, processGroupId);
+            
+            // Возвращаем ответ в NiFi
             Map<String, Object> response = new HashMap<>();
             response.put("status", "STARTED");
-            response.put("message", "Мониторинг запущен");
+            response.put("message", "Мониторинг запущен. Результат будет отправлен на callback URL после завершения.");
+            response.put("correlationId", session.correlationId);
             response.put("processGroupId", processGroupId);
             response.put("config", Map.of(
                 "maxWaitTimeMs", config.getMaxWaitTimeMs(),
@@ -127,16 +134,142 @@ public class FlowCompletionController {
             return ResponseEntity.accepted().body(response);
             
         } catch (Exception e) {
-            logger.error("Error starting monitoring", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            logger.error("Error starting monitoring session", e);
+            activeSessions.remove(processGroupId);
+            return buildErrorResponse("Failed to start monitoring: " + e.getMessage(), 
+                                     HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
 
     /**
-     * Получить статус мониторинга
-     * GET /api/nifi/flow-monitor/{processGroupId}/status
+     * Выполнить сессию мониторинга от начала до конца
      */
-    @GetMapping("/{processGroupId}/status")
+    private FlowMonitoringResult runMonitoringSession(String processGroupId, 
+                                                       MonitoringSession session,
+                                                       FlowCompletionConfig config) {
+        logger.info("Running monitoring session: correlationId={}, processGroupId={}", 
+                   session.correlationId, processGroupId);
+        
+        FlowMonitoringResult result = null;
+        
+        try {
+            // Запускаем мониторинг через сервис
+            FlowCompletionStatus status = monitorService.waitForFlowCompletionWithTracking(
+                processGroupId, config, session.correlationId);
+            
+            // Создаём результат
+            result = FlowMonitoringResult.fromStatus(
+                status,
+                session.correlationId,
+                session.flowName,
+                session.startTime,
+                monitorService.getPeakFlowFileCount(processGroupId),
+                monitorService.getConsecutiveEmptyChecks(processGroupId),
+                session.metadata
+            );
+            
+            // Отправляем callback в NiFi если указан URL
+            if (session.callbackUrl != null && !session.callbackUrl.isEmpty()) {
+                boolean callbackSent = callbackService.sendCallbackWithRetry(
+                    session.callbackUrl, result, 3);
+                
+                if (!callbackSent) {
+                    logger.error("Failed to send callback after retries. Result available via API.");
+                }
+            } else {
+                logger.info("No callback URL provided. Result available via GET /status endpoint.");
+            }
+            
+            return result;
+            
+        } catch (TimeoutException e) {
+            logger.warn("Monitoring timeout: correlationId={}", session.correlationId);
+            result = createTimeoutResult(session, e.getMessage());
+            sendCallbackIfConfigured(session, result);
+            return result;
+            
+        } catch (InterruptedException e) {
+            logger.info("Monitoring interrupted: correlationId={}", session.correlationId);
+            Thread.currentThread().interrupt();
+            result = createInterruptedResult(session);
+            sendCallbackIfConfigured(session, result);
+            return result;
+            
+        } catch (Exception e) {
+            logger.error("Monitoring error: correlationId={}", session.correlationId, e);
+            result = createErrorResult(session, e.getMessage());
+            sendCallbackIfConfigured(session, result);
+            return result;
+            
+        } finally {
+            // Очищаем сессию
+            activeSessions.remove(processGroupId);
+            logger.info("Monitoring session finished: correlationId={}, processGroupId={}", 
+                       session.correlationId, processGroupId);
+        }
+    }
+
+    /**
+     * Отправить callback если настроен
+     */
+    private void sendCallbackIfConfigured(MonitoringSession session, FlowMonitoringResult result) {
+        if (session.callbackUrl != null && !session.callbackUrl.isEmpty()) {
+            callbackService.sendCallbackWithRetry(session.callbackUrl, result, 3);
+        }
+    }
+
+    /**
+     * Создать результат при таймауте
+     */
+    private FlowMonitoringResult createTimeoutResult(MonitoringSession session, String message) {
+        FlowMonitoringResult result = new FlowMonitoringResult();
+        result.setCorrelationId(session.correlationId);
+        result.setProcessGroupId(activeSessions.containsKey(getProcessGroupIdByCorrelation(session.correlationId)) 
+                                 ? getProcessGroupIdByCorrelation(session.correlationId) : "unknown");
+        result.setFlowName(session.flowName);
+        result.setCompleted(false);
+        result.setStatus("TIMEOUT");
+        result.setMessage(message);
+        result.setTimestamp(System.currentTimeMillis());
+        result.setMetadata(session.metadata);
+        return result;
+    }
+
+    /**
+     * Создать результат при прерывании
+     */
+    private FlowMonitoringResult createInterruptedResult(MonitoringSession session) {
+        FlowMonitoringResult result = new FlowMonitoringResult();
+        result.setCorrelationId(session.correlationId);
+        result.setFlowName(session.flowName);
+        result.setCompleted(false);
+        result.setStatus("INTERRUPTED");
+        result.setMessage("Мониторинг был прерван");
+        result.setTimestamp(System.currentTimeMillis());
+        result.setMetadata(session.metadata);
+        return result;
+    }
+
+    /**
+     * Создать результат при ошибке
+     */
+    private FlowMonitoringResult createErrorResult(MonitoringSession session, String errorMessage) {
+        FlowMonitoringResult result = new FlowMonitoringResult();
+        result.setCorrelationId(session.correlationId);
+        result.setFlowName(session.flowName);
+        result.setCompleted(false);
+        result.setStatus("ERROR");
+        result.setMessage("Ошибка: " + errorMessage);
+        result.setTimestamp(System.currentTimeMillis());
+        result.setMetadata(session.metadata);
+        return result;
+    }
+
+    /**
+     * Получить статус мониторинга по processGroupId
+     * GET /api/nifi/flow-monitor/status/{processGroupId}
+     */
+    @GetMapping("/status/{processGroupId}")
     public ResponseEntity<Map<String, Object>> getMonitoringStatus(
             @PathVariable String processGroupId) {
         
@@ -145,26 +278,25 @@ public class FlowCompletionController {
         Map<String, Object> response = new HashMap<>();
         response.put("processGroupId", processGroupId);
         
-        Future<FlowCompletionStatus> future = activeMonitors.get(processGroupId);
+        MonitoringSession session = activeSessions.get(processGroupId);
         
-        if (future == null) {
+        if (session == null) {
             response.put("monitoring", false);
             response.put("message", "Мониторинг не запущен");
             return ResponseEntity.ok(response);
         }
         
         response.put("monitoring", true);
-        response.put("completed", future.isDone());
+        response.put("correlationId", session.correlationId);
+        response.put("flowName", session.flowName);
+        response.put("startTime", session.startTime);
+        response.put("completed", session.future != null && session.future.isDone());
         
-        if (future.isDone()) {
+        if (session.future != null && session.future.isDone()) {
             try {
-                FlowCompletionStatus status = future.get();
-                response.put("status", status);
+                FlowMonitoringResult result = session.future.get();
+                response.put("result", result);
                 response.put("message", "Мониторинг завершен");
-                
-                // Удаляем завершенный мониторинг
-                activeMonitors.remove(processGroupId);
-                
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 response.put("error", "Прервано");
@@ -180,9 +312,9 @@ public class FlowCompletionController {
 
     /**
      * Остановить мониторинг
-     * POST /api/nifi/flow-monitor/{processGroupId}/stop
+     * POST /api/nifi/flow-monitor/stop/{processGroupId}
      */
-    @PostMapping("/{processGroupId}/stop")
+    @PostMapping("/stop/{processGroupId}")
     public ResponseEntity<Map<String, Object>> stopMonitoring(
             @PathVariable String processGroupId) {
         
@@ -191,52 +323,81 @@ public class FlowCompletionController {
         Map<String, Object> response = new HashMap<>();
         response.put("processGroupId", processGroupId);
         
-        Future<FlowCompletionStatus> future = activeMonitors.remove(processGroupId);
+        MonitoringSession session = activeSessions.remove(processGroupId);
         
-        if (future == null) {
-            // Пробуем остановить через сервис
+        if (session == null) {
             monitorService.stopMonitoring(processGroupId);
             response.put("status", "NOT_FOUND");
-            response.put("message", "Активный мониторинг не найден, но отправлен сигнал остановки");
+            response.put("message", "Активный мониторинг не найден");
             return ResponseEntity.ok(response);
         }
         
-        future.cancel(true);
+        if (session.future != null) {
+            session.future.cancel(true);
+        }
         monitorService.stopMonitoring(processGroupId);
         
         response.put("status", "STOPPED");
+        response.put("correlationId", session.correlationId);
         response.put("message", "Мониторинг остановлен");
         
         return ResponseEntity.ok(response);
     }
 
     /**
-     * Получить список всех активных мониторингов
+     * Получить список всех активных сессий
      * GET /api/nifi/flow-monitor/active
      */
     @GetMapping("/active")
-    public ResponseEntity<Map<String, Object>> getActiveMonitors() {
-        logger.debug("Getting active monitors");
+    public ResponseEntity<Map<String, Object>> getActiveSessions() {
+        logger.debug("Getting active monitoring sessions");
         
         Map<String, Object> response = new HashMap<>();
-        response.put("count", activeMonitors.size());
-        response.put("monitors", activeMonitors.keySet());
+        response.put("count", activeSessions.size());
+        
+        Map<String, Map<String, Object>> sessions = new HashMap<>();
+        for (Map.Entry<String, MonitoringSession> entry : activeSessions.entrySet()) {
+            Map<String, Object> sessionInfo = new HashMap<>();
+            sessionInfo.put("correlationId", entry.getValue().correlationId);
+            sessionInfo.put("flowName", entry.getValue().flowName);
+            sessionInfo.put("startTime", entry.getValue().startTime);
+            sessionInfo.put("running", entry.getValue().future != null && !entry.getValue().future.isDone());
+            sessions.put(entry.getKey(), sessionInfo);
+        }
+        
+        response.put("sessions", sessions);
         
         return ResponseEntity.ok(response);
     }
 
     /**
-     * Создать конфигурацию по умолчанию
+     * Построить ответ об ошибке
      */
-    private FlowCompletionConfig createDefaultConfig() {
-        FlowCompletionConfig config = new FlowCompletionConfig();
-        config.setMaxWaitTimeMs(3600000L); // 1 час
-        config.setCheckIntervalMs(5000L); // 5 секунд
-        config.setEmptyQueueThreshold(0);
-        config.setEmptyQueueSizeThreshold(0L);
-        config.setConsecutiveEmptyChecksRequired(3);
-        config.setConsiderOnlyActiveProcessors(true);
-        return config;
+    private ResponseEntity<Map<String, Object>> buildErrorResponse(String message, HttpStatus status) {
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", "ERROR");
+        response.put("message", message);
+        return ResponseEntity.status(status).body(response);
+    }
+
+    /**
+     * Сгенерировать уникальный correlation ID
+     */
+    private String generateCorrelationId() {
+        return "flow-" + System.currentTimeMillis() + "-" + 
+               java.util.UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    /**
+     * Найти processGroupId по correlationId
+     */
+    private String getProcessGroupIdByCorrelation(String correlationId) {
+        for (Map.Entry<String, MonitoringSession> entry : activeSessions.entrySet()) {
+            if (entry.getValue().correlationId.equals(correlationId)) {
+                return entry.getKey();
+            }
+        }
+        return null;
     }
 
     /**
@@ -244,14 +405,16 @@ public class FlowCompletionController {
      */
     @PreDestroy
     public void cleanup() {
-        logger.info("Cleaning up active monitors");
+        logger.info("Cleaning up {} active monitoring sessions", activeSessions.size());
         
-        for (Map.Entry<String, Future<FlowCompletionStatus>> entry : activeMonitors.entrySet()) {
-            entry.getValue().cancel(true);
-            monitorService.stopMonitoring(entry.getKey());
+        for (MonitoringSession session : activeSessions.values()) {
+            if (session.future != null) {
+                session.future.cancel(true);
+            }
+            monitorService.stopMonitoring(getProcessGroupIdByCorrelation(session.correlationId));
         }
         
-        activeMonitors.clear();
+        activeSessions.clear();
         executorService.shutdown();
         
         try {

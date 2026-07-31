@@ -297,6 +297,38 @@ public class FlowCompletionMonitorService {
     }
 
     /**
+     * Запустить мониторинг с отслеживанием метрик для сессии
+     * Вызывается из FlowCompletionController для интеграции с NiFi
+     */
+    public FlowCompletionStatus waitForFlowCompletionWithTracking(String processGroupId, 
+                                                                   FlowCompletionConfig config,
+                                                                   String correlationId) 
+            throws InterruptedException, java.util.concurrent.TimeoutException {
+        
+        logger.info("Starting tracked monitoring for correlationId={}, processGroupId={}", 
+                   correlationId, processGroupId);
+        
+        // Используем существующий метод waitForFlowCompletion
+        return waitForFlowCompletion(processGroupId, config);
+    }
+
+    /**
+     * Получить пиковое количество FlowFile для processGroupId
+     */
+    public Integer getPeakFlowFileCount(String processGroupId) {
+        MonitoringState state = monitoringStates.get(processGroupId);
+        return state != null ? state.maxFlowFileCountObserved : null;
+    }
+
+    /**
+     * Получить количество последовательных пустых проверок
+     */
+    public Integer getConsecutiveEmptyChecks(String processGroupId) {
+        MonitoringState state = monitoringStates.get(processGroupId);
+        return state != null ? state.consecutiveEmptyChecks : null;
+    }
+
+    /**
      * Проанализировать очереди и создать список статусов
      */
     private List<QueueStatus> analyzeQueues(List<Map<String, Object>> connections, FlowCompletionConfig config) {
