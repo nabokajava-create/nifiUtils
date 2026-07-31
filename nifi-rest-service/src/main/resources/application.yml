@@ -1,0 +1,13 @@
+server:
+  port: 8080
+
+nifi:
+  api:
+    base-url: http://localhost:8080/nifi-api
+    timeout: 30000
+    connect-timeout: 10000
+
+logging:
+  level:
+    com.example.nifi: DEBUG
+    org.apache.http: INFO
