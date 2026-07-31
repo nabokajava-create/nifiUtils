@@ -8,13 +8,31 @@
 
 ---
 
+## Важное замечание: Все процессоры стартованы по расписанию
+
+Поскольку все процессоры в процессорной группе **уже стартованы** (запускаются по расписанию), состояние процессоров `Running` не является признаком начала работы потока.
+
+### Единственный признак старта потока
+
+| Критерий | Значение |
+|----------|----------|
+| **Признак старта** | Появление FlowFile в очередях (> 0) |
+| **Признак работы** | Наличие данных в очередях (FlowFile Count > 0) |
+| **Признак завершения** | Очереди пусты ПОСЛЕ того как были данные |
+
+**Не используется:**
+- Состояние процессоров (Running/Stopped) - все процессоры всегда Running
+- ActiveProcessorCount - не является надёжным индикатором
+
+---
+
 ## Ключевое различие: "Не стартовал" vs "Завершился"
 
 ### Проблема
 
 Оба состояния выглядят одинаково при однократной проверке:
-- **Поток не стартовал**: все очереди пусты, процессоры не активны
-- **Поток завершился**: все очереди пусты, процессоры не активны
+- **Поток не стартовал**: все очереди пусты
+- **Поток завершился**: все очереди пусты (после обработки)
 
 ### Решение
 
@@ -23,11 +41,11 @@
 | Критерий | Поток не стартовал | Поток завершился |
 |----------|-------------------|------------------|
 | **Начальное состояние** | Очереди пусты | Очереди могут быть пусты |
-| **Активность в процессе** | ❌ Никогда не было активности | ✅ Была зафиксирована активность |
+| **Активность в процессе** | ❌ Никогда не было FlowFile | ✅ Были зафиксированы FlowFile |
 | **FlowFile в очередях** | Всегда 0 | Было > 0, стало 0 |
-| **Активные процессоры** | Всегда 0 | Было > 0, стало 0 |
 | **Счётчик пустых проверок** | Сбрасывается | Увеличивается |
 | **Статус при таймауте** | `NOT_STARTED` | `TIMEOUT` |
+| **Пик FlowFile** | 0 | > 0 (запоминается) |
 
 ---
 
@@ -38,7 +56,7 @@
 1. **FlowCompletionMonitorService** - основной сервис мониторинга
 2. **FlowCompletionController** - REST контроллер для управления мониторингом
 3. **Модели данных**:
-   - `FlowCompletionStatus` - статус завершения потока (добавлены поля `flowStarted`, `firstActivityTimestamp`, `initialFlowFileCount`, `flowDurationMs`)
+   - `FlowCompletionStatus` - статус завершения потока
    - `QueueStatus` - статус очереди
    - `FlowCompletionConfig` - конфигурация мониторинга
 
@@ -54,13 +72,14 @@ private static class MonitoringState {
     List<QueueStatus> lastQueueStatuses;
     
     // === КЛЮЧЕВЫЕ ПОЛЯ ДЛЯ РАЗЛИЧЕНИЯ СОСТОЯНИЙ ===
-    boolean flowHasStarted = false;           // Флаг: поток стартовал
-    boolean hasSeenActiveProcessors = false;  // Флаг: были активные процессоры
-    boolean hasSeenDataInQueues = false;      // Флаг: были данные в очередях
-    Long firstActivityTimestamp = null;       // Время первой активности
+    boolean flowHasStarted = false;           // Флаг: поток стартовал (появились FlowFile)
+    Long firstActivityTimestamp = null;       // Время появления первых FlowFile
     int totalFlowFileCountAtStart = 0;        // Начальное количество файлов
+    Integer maxFlowFileCountObserved = null;  // Пик количества FlowFile
 }
 ```
+
+**Важно:** Поля `hasSeenActiveProcessors` и `hasSeenDataInQueues` удалены, т.к. для потоков с расписанием единственный признак - появление FlowFile.
 
 ---
 
@@ -78,39 +97,36 @@ state.totalFlowFileCountAtStart = initialStatus.getTotalFlowFileCount();
 
 На каждой итерации:
 
-#### 2.1. Фиксация первой активности (данные в очередях)
+#### 2.1. Отслеживание пика FlowFile (для определения фазы завершения)
 
 ```java
 int currentTotalFlowFiles = status.getTotalFlowFileCount();
-if (currentTotalFlowFiles > 0 && !state.hasSeenDataInQueues) {
-    state.hasSeenDataInQueues = true;
-    state.firstActivityTimestamp = System.currentTimeMillis();
-    logger.info("Detected data in queues: {} files (first activity)", currentTotalFlowFiles);
-}
-```
 
-#### 2.2. Фиксация активности процессоров
-
-```java
-if (status.getActiveProcessorCount() > 0 && !state.hasSeenActiveProcessors) {
-    state.hasSeenActiveProcessors = true;
-    if (state.firstActivityTimestamp == null) {
-        state.firstActivityTimestamp = System.currentTimeMillis();
+if (currentTotalFlowFiles > 0) {
+    if (state.maxFlowFileCountObserved == null || currentTotalFlowFiles > state.maxFlowFileCountObserved) {
+        state.maxFlowFileCountObserved = currentTotalFlowFiles;
     }
-    logger.info("Detected active processors: {}/{}", 
-                status.getActiveProcessorCount(), status.getTotalProcessorCount());
 }
 ```
 
-#### 2.3. Подтверждение старта потока
+#### 2.2. Фиксация первой активности (появление FlowFile)
 
 ```java
-if (state.confirmFlowStarted() && !state.flowHasStarted) {
+if (currentTotalFlowFiles > 0 && !state.flowHasStarted) {
     state.flowHasStarted = true;
-    logger.info("Flow confirmed as STARTED at timestamp: {}", state.firstActivityTimestamp);
+    state.firstActivityTimestamp = System.currentTimeMillis();
+    logger.info("Detected data in queues: {} files (flow STARTED)", currentTotalFlowFiles);
 }
+```
 
-// confirmFlowStarted() = hasSeenActiveProcessors OR hasSeenDataInQueues
+**Ключевой момент:** Поскольку все процессоры стартованы по расписанию, появление FlowFile - единственный признак начала работы потока.
+
+#### 2.3. Проверка подтверждения старта
+
+```java
+boolean confirmFlowStarted() {
+    return flowHasStarted;  // Только по наличию FlowFile
+}
 ```
 
 ### Шаг 3: Логика определения завершения
@@ -137,21 +153,21 @@ if (allQueuesEmpty) {
         state.consecutiveEmptyChecks++;
         
         if (state.consecutiveEmptyChecks >= config.getConsecutiveEmptyChecksRequired()) {
-            if (status.getActiveProcessorCount() == 0 || !config.isConsiderOnlyActiveProcessors()) {
-                status.setCompleted(true);
-                status.setStatus("COMPLETED");
+            // Поток завершен: все очереди пусты после того как поток стартовал
+            status.setCompleted(true);
+            status.setStatus("COMPLETED");
+            
+            long flowDuration = state.firstActivityTimestamp != null 
+                ? (System.currentTimeMillis() - state.firstActivityTimestamp) 
+                : 0L;
                 
-                long flowDuration = state.firstActivityTimestamp != null 
-                    ? (System.currentTimeMillis() - state.firstActivityTimestamp) 
-                    : 0L;
-                    
-                status.setMessage(String.format(
-                    "Поток завершен: все очереди пусты в течение %d сек (общее время работы: %d мс)",
-                    state.consecutiveEmptyChecks * interval / 1000,
-                    flowDuration
-                ));
-                return status;
-            }
+            status.setMessage(String.format(
+                "Поток завершен: все очереди пусты в течение %d сек (общее время работы: %d мс, пик: %d файлов)",
+                state.consecutiveEmptyChecks * interval / 1000,
+                flowDuration,
+                state.maxFlowFileCountObserved != null ? state.maxFlowFileCountObserved : 0
+            ));
+            return status;
         }
     } else {
         // ❌ Очереди пусты, но поток ещё не стартовал - это НЕ завершение
@@ -167,10 +183,10 @@ if (allQueuesEmpty) {
 if (elapsed > timeout) {
     if (!state.confirmFlowStarted()) {
         timeoutStatus.setStatus("NOT_STARTED");
-        timeoutStatus.setMessage("Поток не стартовал: не было обнаружено активности");
+        timeoutStatus.setMessage("Поток не стартовал: не было обнаружено данных в очередях (FlowFiles)");
     } else {
         timeoutStatus.setStatus("TIMEOUT");
-        timeoutStatus.setMessage("Превышено максимальное время ожидания");
+        timeoutStatus.setMessage("Превышено максимальное время ожидания: " + timeout + " мс");
     }
     throw new TimeoutException(...);
 }
@@ -193,28 +209,27 @@ if (elapsed > timeout) {
                           │
                           ▼
         ┌─────────────────────────────────────────┐
-        │  Есть данные в очередях ИЛИ активные    │
-        │  процессоры?                            │
+        │  Есть FlowFile в очередях?              │
+        │  (totalFlowFileCount > 0)               │
         └───────────┬─────────────────┬───────────┘
                     │ YES             │ NO
                     ▼                 ▼
         ┌───────────────────┐  ┌─────────────────────────┐
-        │ hasSeenData =     │  │ confirmFlowStarted()?   │
-        │ hasSeenProc =     │  │                         │
-        │ flowHasStarted=   │  │ ┌───────┐ ┌───────────┐ │
-        │ firstActivity =   │  │ │  NO   │ │    YES    │ │
-        │ now               │  │ │       │ │           │ │
-        │                   │  │ │ Сброс │ │ Увеличение│ │
-        │ conseqEmpty = 0   │  │ │ счётч │ │ счётчика  │ │
-        └───────────────────┘  │ │ ика   │ │ пустых    │ │
-                               │ │       │ │ проверок  │ │
-                               │ └───────┘ └─────┬─────┘ │
-                               └─────────────────┼───────┘
+        │ Запоминаем пик    │  │ flowHasStarted?         │
+        │ Обновляем         │  │                         │
+        │ maxFlowFileCount  │  │ ┌───────┐ ┌───────────┐ │
+        │                   │  │ │  NO   │ │    YES    │ │
+        │ flowHasStarted =  │  │ │       │ │           │ │
+        │ true              │  │ │ Сброс │ │ Увеличение│ │
+        │ firstActivity =   │  │ │ счётч │ │ счётчика  │ │
+        │ now               │  │ │ ика   │ │ пустых    │ │
+        │                   │  │ │       │ │ проверок  │ │
+        │ conseqEmpty = 0   │  │ └───────┘ └─────┬─────┘ │
+        └───────────────────┘  └─────────────────┼───────┘
                                                  │
                                                  ▼
                                     ┌─────────────────────────┐
                                     │ conseqEmpty >= threshold│
-                                    │ AND activeProc == 0?    │
                                     └───────────┬─────────────┘
                                                 │
                         ┌───────────────────────┼───────────────────────┐
@@ -225,6 +240,7 @@ if (elapsed > timeout) {
             │ (sleep interval)  │   │ - flowStarted = true  │
             └───────────────────┘   │ - flowDuration = now  │
                                     │   - firstActivity     │
+                                    │ - maxFlowFileObserved │
                                     └───────────────────────┘
 ```
 
@@ -239,10 +255,11 @@ if (elapsed > timeout) {
     "emptyQueueThreshold": 0,          // Порог количества файлов для "пустой" очереди
     "emptyQueueSizeThreshold": 0,      // Порог размера очереди в байтах
     "consecutiveEmptyChecksRequired": 3, // Количество последовательных пустых проверок
-    "considerOnlyActiveProcessors": true, // Учитывать активные процессоры
     "ignoredQueuePatterns": []         // Паттерны игнорируемых очередей (regex)
 }
 ```
+
+**Удалён параметр:** `considerOnlyActiveProcessors` - не используется, т.к. все процессоры всегда Running.
 
 ---
 
@@ -266,14 +283,15 @@ Content-Type: application/json
     "status": "RUNNING",
     "totalQueueSize": 1024,
     "totalFlowFileCount": 5,
-    "activeProcessorCount": 3,
+    "activeProcessorCount": 10,
     "totalProcessorCount": 10,
-    "flowStarted": true,              // ← Новое поле
-    "firstActivityTimestamp": 1234567890,  // ← Новое поле
-    "initialFlowFileCount": 0,        // ← Новое поле
+    "flowStarted": true,
+    "firstActivityTimestamp": 1234567890,
+    "initialFlowFileCount": 0,
+    "maxFlowFileCountObserved": 25,
     "queueStatuses": [...],
     "checkTimestamp": 1234567890,
-    "message": "Поток выполняется: 5 файлов в очередях, 3/10 активных процессоров"
+    "message": "Поток выполняется: 5 файлов в очередях, 10/10 процессоров Running"
 }
 ```
 
@@ -302,8 +320,7 @@ GET /api/nifi/flow-monitor/{processGroupId}/status
         "status": "IDLE",
         "flowStarted": false,
         "totalFlowFileCount": 0,
-        "activeProcessorCount": 0,
-        "message": "Ожидание старта потока..."
+        "message": "Ожидание старта потока (ожидание появления FlowFile)..."
     }
 }
 ```
@@ -319,7 +336,8 @@ GET /api/nifi/flow-monitor/{processGroupId}/status
         "flowStarted": true,
         "firstActivityTimestamp": 1234567890,
         "flowDurationMs": 125000,
-        "message": "Поток завершен: все очереди пусты в течение 15 сек (время работы: 125000 мс)"
+        "maxFlowFileCountObserved": 25,
+        "message": "Поток завершен: все очереди пусты в течение 15 сек (время работы: 125000 мс, пик: 25 файлов)"
     }
 }
 ```
@@ -333,7 +351,7 @@ GET /api/nifi/flow-monitor/{processGroupId}/status
     "lastStatus": {
         "status": "NOT_STARTED",
         "flowStarted": false,
-        "message": "Поток не стартовал: не было обнаружено активности в очередях или процессорах"
+        "message": "Поток не стартовал: не было обнаружено данных в очередях (FlowFiles)"
     }
 }
 ```
@@ -345,9 +363,8 @@ GET /api/nifi/flow-monitor/{processGroupId}/status
 | Статус | Описание | flowStarted |
 |--------|----------|-------------|
 | `COMPLETED` | Поток завершён: очереди пусты после активности | `true` |
-| `RUNNING` | Поток выполняется: есть данные или активные процессоры | `true` |
-| `STOPPED` | Все процессоры остановлены, но могут быть данные в очередях | `true` |
-| `IDLE` | Нет данных в очередях, ожидание старта | `false` |
+| `RUNNING` | Поток выполняется: есть FlowFile в очередях | `true` |
+| `IDLE` | Нет FlowFile в очередях, ожидание старта | `false` |
 | `NOT_STARTED` | Таймаут ожидания старта потока | `false` |
 | `TIMEOUT` | Превышено время ожидания после старта | `true` |
 | `ERROR` | Произошла ошибка при проверке | `null` |
@@ -362,30 +379,28 @@ GET /api/nifi/flow-monitor/{processGroupId}/status
 T0:  Мониторинг запущен
      initialFlowFileCount = 0
      flowHasStarted = false
+     maxFlowFileCountObserved = null
 
 T5:  Проверка #1
      totalFlowFileCount = 0
-     activeProcessorCount = 0
-     → confirmFlowStarted() = false
+     → flowHasStarted = false
      → consecutiveEmptyChecks = 0 (сброшен)
 
 T10: Проверка #2
-     totalFlowFileCount = 15  ← ПОЯВИЛИСЬ ДАННЫЕ!
-     activeProcessorCount = 3
-     → hasSeenDataInQueues = true
-     → hasSeenActiveProcessors = true
+     totalFlowFileCount = 15  ← ПОЯВИЛИСЬ FLOWFILE!
      → flowHasStarted = true
      → firstActivityTimestamp = T10
+     → maxFlowFileCountObserved = 15
      → consecutiveEmptyChecks = 0
 
 T15-T45: Поток выполняется
      totalFlowFileCount меняется: 15 → 25 → 10 → 5 → 2
+     maxFlowFileCountObserved обновляется: 15 → 25
      consecutiveEmptyChecks = 0
 
 T50: Проверка #N
      totalFlowFileCount = 0  ← ОЧЕРЕДИ ОПУСТЕЛИ!
-     activeProcessorCount = 0
-     → confirmFlowStarted() = true (была активность!)
+     → flowHasStarted = true (была активность!)
      → consecutiveEmptyChecks = 1
 
 T55: Проверка #N+1
@@ -397,6 +412,7 @@ T60: Проверка #N+2
      → consecutiveEmptyChecks = 3 (порог достигнут!)
      → COMPLETED!
      → flowDurationMs = T60 - T10 = 50000 мс
+     → message = "Поток завершен: все очереди пусты в течение 15 сек (время работы: 50000 мс, пик: 25 файлов)"
 ```
 
 ### Сценарий 2: Поток не стартовал (таймаут)
@@ -408,14 +424,13 @@ T0:  Мониторинг запущен
 
 T5-T300: Проверки каждые 5 секунд
      totalFlowFileCount = 0 (всегда)
-     activeProcessorCount = 0 (всегда)
-     → confirmFlowStarted() = false
+     → flowHasStarted = false
      → consecutiveEmptyChecks = 0 (постоянно сбрасывается)
 
 T300: Таймаут (maxWaitTimeMs = 300000)
-     → confirmFlowStarted() = false
+     → flowHasStarted = false
      → статус = "NOT_STARTED"
-     → сообщение = "Поток не стартовал: не было обнаружено активности"
+     → сообщение = "Поток не стартовал: не было обнаружено данных в очередях (FlowFiles)"
 ```
 
 ### Сценарий 3: Поток был запущен ранее (очереди уже содержат данные)
@@ -427,18 +442,21 @@ T0:  Мониторинг запущен
 
 T0:  Первая проверка
      totalFlowFileCount = 50
-     → hasSeenDataInQueues = true (немедленно!)
-     → flowHasStarted = true
+     → flowHasStarted = true (немедленно!)
      → firstActivityTimestamp = T0
+     → maxFlowFileCountObserved = 50
 
 T5-T50: Поток обрабатывает данные
      totalFlowFileCount: 50 → 40 → 25 → 10 → 0
+     maxFlowFileCountObserved = 50 (не изменился, т.к. только уменьшается)
 
 T55: Проверка
      totalFlowFileCount = 0
      → consecutiveEmptyChecks = 1
 
 T65: COMPLETED!
+     flowDurationMs = 65000
+     message = "... (пик: 50 файлов)"
 ```
 
 ---
@@ -500,7 +518,7 @@ public void processScheduledFlow(String processGroupId) {
         if (status.isCompleted()) {
             log.info("Поток завершён успешно: {}", status.getMessage());
             log.info("Время выполнения: {} мс", status.getFlowDurationMs());
-            log.info("Первая активность: {}", status.getFirstActivityTimestamp());
+            log.info("Пик FlowFile: {}", status.getMaxFlowFileCountObserved());
         }
     } catch (TimeoutException e) {
         if ("NOT_STARTED".equals(status.getStatus())) {
@@ -521,6 +539,38 @@ public void processScheduledFlow(String processGroupId) {
 switch (status.getStatus()) {
     case "COMPLETED":
         // Поток успешно завершился
+        log.info("Поток завершён. Время работы: {} мс", status.getFlowDurationMs());
+        break;
+        
+    case "NOT_STARTED":
+        // Поток не стартовал (не появилось FlowFile)
+        log.error("Поток не стартовал: проверьте расписание процессоров");
+        break;
+        
+    case "TIMEOUT":
+        // Поток стартовал, но не завершился вовремя
+        log.warn("Поток выполняется дольше ожидаемого");
+        break;
+        
+    case "ERROR":
+        // Ошибка при проверке
+        log.error("Ошибка мониторинга: {}", status.getMessage());
+        break;
+}
+```
+
+---
+
+## Заключение
+
+Алгоритм надёжно определяет завершение потока NiFi даже когда все процессоры стартованы по расписанию. Ключевое отличие - отслеживание появления FlowFile в очередях как единственного признака начала работы потока.
+
+**Основные преимущества:**
+1. ✅ Корректно различает "не стартовал" и "завершился"
+2. ✅ Не зависит от состояния процессоров (Running/Stopped)
+3. ✅ Запоминает пик активности для отладки
+4. ✅ Поддерживает configurable пороги и таймауты
+5. ✅ Предоставляет детальную информацию о выполнении
         sendNotification("Flow completed", status);
         break;
         

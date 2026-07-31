@@ -36,6 +36,10 @@ public class FlowCompletionMonitorService {
 
     /**
      * Внутренний класс для хранения состояния мониторинга
+     * 
+     * ВАЖНО: Поскольку все процессоры стартованы по расписанию,
+     * признак начала работы потока - только появление данных в очередях (FlowFiles).
+     * Состояние процессоров (Running/Stopped) не используется для определения старта.
      */
     private static class MonitoringState {
         long startTime;
@@ -45,10 +49,9 @@ public class FlowCompletionMonitorService {
         
         // Ключевые поля для отличия "не стартовал" от "завершился"
         boolean flowHasStarted = false;
-        boolean hasSeenActiveProcessors = false;
-        boolean hasSeenDataInQueues = false;
         Long firstActivityTimestamp = null;
         int totalFlowFileCountAtStart = 0;
+        Integer maxFlowFileCountObserved = null; // Пик активности для определения фазы завершения
         
         MonitoringState() {
             this.startTime = System.currentTimeMillis();
@@ -58,10 +61,13 @@ public class FlowCompletionMonitorService {
         }
         
         /**
-         * Проверить, что поток действительно запустился (была активность)
+         * Проверить, что поток действительно запустился (появились данные в очередях)
+         * 
+         * Поскольку все процессоры стартованы по расписанию, единственный признак старта -
+         * появление FlowFile в очередях после начала мониторинга.
          */
         boolean confirmFlowStarted() {
-            return flowHasStarted || hasSeenActiveProcessors || hasSeenDataInQueues;
+            return flowHasStarted;
         }
     }
 
@@ -177,7 +183,7 @@ public class FlowCompletionMonitorService {
                     // Определяем причину таймаута
                     if (!state.confirmFlowStarted()) {
                         timeoutStatus.setStatus("NOT_STARTED");
-                        timeoutStatus.setMessage("Поток не стартовал: не было обнаружено активности в очередях или процессорах");
+                        timeoutStatus.setMessage("Поток не стартовал: не было обнаружено данных в очередях (FlowFiles)");
                     } else {
                         timeoutStatus.setStatus("TIMEOUT");
                         timeoutStatus.setMessage("Превышено максимальное время ожидания: " + timeout + " мс");
@@ -190,28 +196,23 @@ public class FlowCompletionMonitorService {
                 FlowCompletionStatus status = checkFlowCompletion(processGroupId, config);
                 
                 // === КЛЮЧЕВОЙ АЛГОРИТМ: Отслеживание активности потока ===
+                // Поскольку все процессоры стартованы по расписанию, единственный признак работы потока -
+                // появление данных (FlowFiles) в очередях
+                
+                int currentTotalFlowFiles = status.getTotalFlowFileCount();
+                
+                // Отслеживаем пик количества FlowFile для определения фазы завершения
+                if (currentTotalFlowFiles > 0) {
+                    if (state.maxFlowFileCountObserved == null || currentTotalFlowFiles > state.maxFlowFileCountObserved) {
+                        state.maxFlowFileCountObserved = currentTotalFlowFiles;
+                    }
+                }
                 
                 // Фиксируем первую активность (появление данных в очередях)
-                int currentTotalFlowFiles = status.getTotalFlowFileCount();
-                if (currentTotalFlowFiles > 0 && !state.hasSeenDataInQueues) {
-                    state.hasSeenDataInQueues = true;
-                    state.firstActivityTimestamp = System.currentTimeMillis();
-                    logger.info("Detected data in queues: {} files (first activity)", currentTotalFlowFiles);
-                }
-                
-                // Фиксируем активность процессоров
-                if (status.getActiveProcessorCount() > 0 && !state.hasSeenActiveProcessors) {
-                    state.hasSeenActiveProcessors = true;
-                    if (state.firstActivityTimestamp == null) {
-                        state.firstActivityTimestamp = System.currentTimeMillis();
-                    }
-                    logger.info("Detected active processors: {}/{}", status.getActiveProcessorCount(), status.getTotalProcessorCount());
-                }
-                
-                // Поток считается запущенным, если была любая активность
-                if (state.confirmFlowStarted() && !state.flowHasStarted) {
+                if (currentTotalFlowFiles > 0 && !state.flowHasStarted) {
                     state.flowHasStarted = true;
-                    logger.info("Flow confirmed as STARTED at timestamp: {}", state.firstActivityTimestamp);
+                    state.firstActivityTimestamp = System.currentTimeMillis();
+                    logger.info("Detected data in queues: {} files (flow STARTED)", currentTotalFlowFiles);
                 }
                 
                 // === ЛОГИКА ЗАВЕРШЕНИЯ ===
@@ -237,23 +238,22 @@ public class FlowCompletionMonitorService {
                                     state.consecutiveEmptyChecks, config.getConsecutiveEmptyChecksRequired());
                         
                         if (state.consecutiveEmptyChecks >= config.getConsecutiveEmptyChecksRequired()) {
-                            // Дополнительная проверка: нет ли активных процессоров
-                            if (status.getActiveProcessorCount() == 0 || !config.isConsiderOnlyActiveProcessors()) {
-                                status.setCompleted(true);
-                                status.setStatus("COMPLETED");
+                            // Поток завершен: все очереди пусты после того как поток стартовал
+                            status.setCompleted(true);
+                            status.setStatus("COMPLETED");
+                            
+                            long flowDuration = state.firstActivityTimestamp != null 
+                                ? (System.currentTimeMillis() - state.firstActivityTimestamp) 
+                                : 0L;
                                 
-                                long flowDuration = state.firstActivityTimestamp != null 
-                                    ? (System.currentTimeMillis() - state.firstActivityTimestamp) 
-                                    : 0L;
-                                    
-                                status.setMessage(String.format(
-                                    "Поток завершен: все очереди пусты в течение %d сек (общее время работы: %d мс)",
-                                    state.consecutiveEmptyChecks * interval / 1000,
-                                    flowDuration
-                                ));
-                                state.isMonitoring = false;
-                                return status;
-                            }
+                            status.setMessage(String.format(
+                                "Поток завершен: все очереди пусты в течение %d сек (общее время работы: %d мс, пик: %d файлов)",
+                                state.consecutiveEmptyChecks * interval / 1000,
+                                flowDuration,
+                                state.maxFlowFileCountObserved != null ? state.maxFlowFileCountObserved : 0
+                            ));
+                            state.isMonitoring = false;
+                            return status;
                         }
                     } else {
                         // Очереди пусты, но поток ещё не стартовал - это НЕ завершение
