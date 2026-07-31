@@ -18,6 +18,12 @@ public class FlowCompletionStatus {
     private List<QueueStatus> queueStatuses;
     private long checkTimestamp;
     private String message;
+    
+    // Дополнительные поля для отслеживания жизненного цикла потока
+    private Boolean flowStarted;        // true - поток стартовал, false - ещё нет, null - неизвестно
+    private Long firstActivityTimestamp; // время первой зафиксированной активности
+    private Integer initialFlowFileCount; // количество файлов в очередях на момент начала мониторинга
+    private Long flowDurationMs;          // длительность выполнения потока (от старта до завершения)
 
     public FlowCompletionStatus() {}
 
@@ -116,6 +122,38 @@ public class FlowCompletionStatus {
         this.message = message;
     }
 
+    public Boolean getFlowStarted() {
+        return flowStarted;
+    }
+
+    public void setFlowStarted(Boolean flowStarted) {
+        this.flowStarted = flowStarted;
+    }
+
+    public Long getFirstActivityTimestamp() {
+        return firstActivityTimestamp;
+    }
+
+    public void setFirstActivityTimestamp(Long firstActivityTimestamp) {
+        this.firstActivityTimestamp = firstActivityTimestamp;
+    }
+
+    public Integer getInitialFlowFileCount() {
+        return initialFlowFileCount;
+    }
+
+    public void setInitialFlowFileCount(Integer initialFlowFileCount) {
+        this.initialFlowFileCount = initialFlowFileCount;
+    }
+
+    public Long getFlowDurationMs() {
+        return flowDurationMs;
+    }
+
+    public void setFlowDurationMs(Long flowDurationMs) {
+        this.flowDurationMs = flowDurationMs;
+    }
+
     @Override
     public String toString() {
         return "FlowCompletionStatus{" +
@@ -127,6 +165,8 @@ public class FlowCompletionStatus {
                 ", totalFlowFileCount=" + totalFlowFileCount +
                 ", activeProcessorCount=" + activeProcessorCount +
                 ", totalProcessorCount=" + totalProcessorCount +
+                ", flowStarted=" + flowStarted +
+                ", flowDurationMs=" + flowDurationMs +
                 '}';
     }
 }
