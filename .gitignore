@@ -1,44 +1,32 @@
-# Java/Maven specific
+```
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
 target/
-*.class
-*.jar
-*.war
-*.ear
-*.zip
-*.tar.gz
 
-# IDE files
-.idea/
-*.iml
-*.ipr
-*.iws
-.vscode/
-
-# System files
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
+# TypeScript/JavaScript
+*.tsbuildinfo
+*.js.map
+*.jsx.map
+*.ts.map
 
 # Environment
 .env
 .env.local
 *.env.*
 
-# Dependencies
-node_modules/
-lib/node_modules/
-venv/
-.venv/
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Build artifacts
-dist/
-build/
-out/
+# Logs
+*.log
 
-# Python (if any Python components)
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Temporary files
+*.tmp
+```
