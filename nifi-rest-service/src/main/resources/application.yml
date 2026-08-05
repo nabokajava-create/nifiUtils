@@ -1,6 +1,25 @@
 server:
   port: 8080
 
+spring:
+  datasource:
+    url: jdbc:h2:mem:nifidb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: 
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
 nifi:
   api:
     base-url: http://localhost:8080/nifi-api
@@ -11,3 +30,4 @@ logging:
   level:
     com.example.nifi: DEBUG
     org.apache.http: INFO
+    org.hibernate.SQL: DEBUG
